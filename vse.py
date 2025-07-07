@@ -8,16 +8,16 @@ import torch.nn.init
 import torch.backends.cudnn as cudnn
 from torch.nn.utils import clip_grad_norm_
 
-from .encoders import get_image_encoder, get_text_encoder
+from encoders import get_image_encoder, get_text_encoder
 
-from .loss import UTO
+from loss import UTO
 
 import logging
 import copy
 import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 from graph_model import VisualGraph, TextualGraph
-from GUS import GusEnhanced
+from GUS import GusEnhancedCCF
 class USER(nn.Module):
     """
         The standard VSE model
@@ -26,6 +26,7 @@ class USER(nn.Module):
         super().__init__()
         # Build Models
         self.grad_clip = opt.grad_clip
+
         self.img_enc = get_image_encoder(opt.data_name, opt.img_dim, opt.embed_size,
                                          precomp_enc_type=opt.precomp_enc_type,
                                          backbone_source=opt.backbone_source,
@@ -34,6 +35,7 @@ class USER(nn.Module):
                                          opt = opt)
 
         self.txt_enc = get_text_encoder(opt.embed_size, no_txtnorm=opt.no_txtnorm)
+
 
         if opt.use_moco:
             self.K = opt.moco_M
@@ -98,11 +100,9 @@ class USER(nn.Module):
         self.data_parallel = False
 
 
-        self.i2t_match_G = VisualGraph(
-            16, 32, 1, dropout=.5)
-        self.t2i_match_G = TextualGraph(
-            16, 32, 1, dropout=.5)
-        self.gus = GusEnhanced()
+        self.i2t_match_G = VisualGraph(16, 32, 1, dropout=.5)
+        self.t2i_match_G = TextualGraph(16, 32, 1, dropout=.5)
+        self.gus = GusEnhancedCCF(tau=opt.ccf_tau, lambda_cf=opt.ccf_lambda)
 
 
     def set_max_violation(self, max_violation):
@@ -180,7 +180,7 @@ class USER(nn.Module):
 
             self._dequeue_and_enqueue(v_embed_k, t_embed_k)
 
-            return img_emb, cap_emb, loss_moco , lengths
+            return img_emb, cap_emb, loss_moco , lengths , v_embed_k, t_embed_k
 
         return img_emb, cap_emb , lengths
 
@@ -195,45 +195,42 @@ class USER(nn.Module):
         return loss
 
     def forward_local(self, img_emb, cap_emb, bbox, depends, cap_lens):
-        i2t_scores, v_m, v_s = self.i2t_match_G(
-            img_emb, cap_emb, bbox, cap_lens, self.opt)
-        t2i_scores, t_m, t_s = self.t2i_match_G(
-            img_emb, cap_emb, depends, cap_lens, self.opt)
-        scores = i2t_scores + t2i_scores
-        return scores,v_m, v_s,t_m, t_s
 
-    def forward_global(self,v_m, v_s,t_m, t_s):
+        i2t_scores, v_m, v_s, alpha_v = self.i2t_match_G(img_emb, cap_emb, bbox, cap_lens, self.opt)
+        t2i_scores, t_m, t_s, alpha_t = self.t2i_match_G(img_emb, cap_emb, depends, cap_lens, self.opt)
+        return (i2t_scores + t2i_scores), v_m, v_s, t_m, t_s, alpha_v, alpha_t
 
-        sim = self.gus(v_m, v_s, t_m, t_s)
+    def forward_global(self, v_m, v_s, t_m, t_s, alpha_v, alpha_t):
+        # 传入 t_queue 负样本
+        neg_z_t = self.t_queue.t()  # [K, embed_size]
+        return self.gus(v_m, v_s, t_m, t_s, alpha_v, alpha_t, neg_z_t)
 
-        return sim
+    def train_emb(self, images, captions, lengths, bbox, depends, image_lengths=None, warmup_alpha=None):
+        # 1) embeddings + MoCo
+        img_emb, cap_emb, loss_moco, cap_lens, v_k, t_k = self.forward_emb(images, captions, lengths, image_lengths,
+                                                                           is_train=True)
+        # 2) encoder loss
+        loss_enc = self.forward_loss(img_emb, cap_emb)
 
-    def train_emb(self, images, captions, lengths,bbox, depends, image_lengths=None,
-                  warmup_alpha=None ):
-        """One training step given images and captions.
-        """
-        self.Eiters += 1
-        self.logger.update('Eit', self.Eiters)
-        self.logger.update('lr', self.optimizer.param_groups[0]['lr'])
-        
-        # # compute the embeddings
+        # 3) local
+        sim_local, v_m, v_s, t_m, t_s, alpha_v, alpha_t = self.forward_local(img_emb, cap_emb, bbox, depends, cap_lens)
 
-        img_emb, cap_emb, loss_moco, cap_lens = self.forward_emb(images, captions, lengths, image_lengths=image_lengths,
-                                            is_train=True)
-        self.logger.update('Le_moco', loss_moco.data.item(), img_emb.size(0))
+        # 4) global + CCF
+        loss_w2, loss_kl, sim_global, loss_ccf = self.forward_global(v_m, v_s, t_m, t_s, alpha_v, alpha_t)
 
-        loss_encoder = self.forward_loss(img_emb, cap_emb)
-
-        '''local'''
-        sim_local, v_m, v_s,t_m, t_s = self.forward_local(img_emb, cap_emb, bbox, depends, cap_lens)
-        '''global'''
-        loss_w2, loss_kl, sim_global = self.forward_global(v_m, v_s,t_m, t_s)
-
+        # 5) total
         sim = sim_local + sim_global
+        loss_rank = self.rank_loss(sim)
+        total_loss = loss_rank + loss_moco + loss_enc + loss_w2 + loss_kl + loss_ccf
 
-        loss =sim + loss_encoder + loss_moco + loss_w2 + loss_kl
+        # 6) backward/update ...
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        if self.grad_clip > 0:
+            clip_grad_norm_(self.params, self.grad_clip)
+        self.optimizer.step()
 
-        self.logger.update('Loss', loss.data.item(), img_emb.size(0))
+        return total_loss
             
 
 
