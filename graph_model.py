@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from layers import ImageQueryGraphConvolution
-from layers import TextQueryGraphConvolution
+from .layers import ImageQueryGraphConvolution
+from .layers import TextQueryGraphConvolution
 import numpy as np
 
 
@@ -163,8 +163,8 @@ class VisualGraph(nn.Module):
         # (batch, n_region, num_block)
         vnode_mvector = cosine_similarity(
             qry_set, ctx_set, dim=-1)
-
-        return vnode_mvector
+        alpha_region = F.softmax(vnode_mvector.mean(dim=-1), dim=1)  # [B,R]
+        return vnode_mvector, alpha_region         # ← 返回两样
 
     def structure_level_matching(self, vnode_mvector, pseudo_coord):
         # (batch, n_region, n_region, num_block)
@@ -188,6 +188,7 @@ class VisualGraph(nn.Module):
         similarities = []  # (n_image, n_caption)
         mu_mix_all = []  # [(B, R, E), ...]  per-caption
         sigma_mix_all = []
+        alpha_mix_all = []
 
         n_block = opt.embed_size // opt.num_block
         n_image, n_caption = images.size(0), captions.size(0)
@@ -204,18 +205,21 @@ class VisualGraph(nn.Module):
             cap_i_expand = cap_i.repeat(n_image, 1, 1)
             # --> compute similarity between query region and context word
             # --> (batch, n_region, n_word)
-            vnode_mvector = self.node_level_matching(
-                cap_i_expand, images, n_block, opt.lambda_softmax)
+
+            vnode_mvector, alpha_region = self.node_level_matching(
+                cap_i_expand, images, n_block, 20)
             v2t_similarity , mu_i, sigma_i = self.structure_level_matching(
                 vnode_mvector, pseudo_coord)
 
             similarities.append(v2t_similarity)
             mu_mix_all.append(mu_i)          # 直接把 R 个分量留着
             sigma_mix_all.append(sigma_i)
+            alpha_mix_all.append(alpha_region)
 
         similarities = torch.cat(similarities, 1)  # (B, n_caption)
         v_m = torch.stack(mu_mix_all, dim=1)  # (B, n_caption, R, E)
         v_s = torch.stack(sigma_mix_all, dim=1)
+        alpha_v = torch.stack(alpha_mix_all, dim=1)  # (B,C,R)
 
         weights = F.softmax(similarities, dim=1)
         w = weights.unsqueeze(-1).unsqueeze(-1)
@@ -223,7 +227,7 @@ class VisualGraph(nn.Module):
         var_region = (w * (v_s**2 + v_m**2)).sum(dim=1) - mu_region**2
         sigma_region = torch.sqrt(var_region.clamp(min=1e-8))
 
-        return similarities,  mu_region, sigma_region
+        return similarities,  v_m, v_s, alpha_v
 
     def _compute_pseudo(self, bb_centre):
 
@@ -269,7 +273,7 @@ class TextualGraph(nn.Module):
         self.out_2 = nn.utils.weight_norm(nn.Linear(hid_dim, out_dim))
 
     def build_sparse_graph(self, dep, lens):
-        adj = np.zeros((lens, lens), dtype=np.int)
+        adj = np.zeros((lens, lens), dtype=int)
         for i, pair in enumerate(dep):
             if i == 0 or pair[0] >= lens or pair[1] >= lens:
                 continue
@@ -300,7 +304,9 @@ class TextualGraph(nn.Module):
 
         tnode_mvector = cosine_similarity(
             qry_set, ctx_set, dim=-1)  # (batch, n_word, num_block)
-        return tnode_mvector
+        alpha_word = F.softmax(tnode_mvector.mean(dim=-1), dim=1)  # [B, W]
+
+        return tnode_mvector, alpha_word
 
     def structure_level_matching(self, tnode_mvector, intra_relation, depends, opt):
         # (batch, n_word, 1, num_block)
@@ -327,8 +333,10 @@ class TextualGraph(nn.Module):
     def forward(self, images, captions, depends, cap_lens, opt):
         n_image = images.size(0)
         n_caption = captions.size(0)
-        similarities, mu_mix_all, sigma_mix_all = [], [], []
+        similarities, mu_mix_all, sigma_mix_all, alpha_mix_all = [], [], [], []
         n_block = opt.embed_size // opt.num_block
+
+
         for i in range(n_caption):
             # Get the i-th text description
             n_word = cap_lens[i]
@@ -340,7 +348,7 @@ class TextualGraph(nn.Module):
             # --> (1, n_word, n_word, 1)
             words_sim = intra_relations(
                 cap_i, cap_i, opt.lambda_softmax).unsqueeze(-1)
-            nodes_sim = self.node_level_matching(
+            nodes_sim, alpha_word = self.node_level_matching(
                 images, cap_i_expand, n_block, opt.lambda_softmax)
 
             phrase_sim, mu_i, sigma_i = self.structure_level_matching(
@@ -349,11 +357,13 @@ class TextualGraph(nn.Module):
             similarities.append(phrase_sim)
             mu_mix_all.append(mu_i)           # (B,W,E)
             sigma_mix_all.append(sigma_i)
+            alpha_mix_all.append(alpha_word)  # (B,W)
 
         # (n_image, n_caption)
         similarities = torch.cat(similarities, 1)
         t_m = torch.stack(mu_mix_all,    1)       # (B, n_caption, W, E)
         t_s = torch.stack(sigma_mix_all, 1)
+        alpha_t = torch.stack(alpha_mix_all, 1)  # (B, C, W)
 
         weights = F.softmax(similarities, dim=1)  # (B, C)
         w = weights.unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
@@ -362,4 +372,4 @@ class TextualGraph(nn.Module):
         var_word = (w * (t_s**2 + t_m**2)).sum(dim=1) - mu_word**2
         sigma_word = torch.sqrt(var_word.clamp(min=1e-8))  # (B, W, E)
 
-        return similarities, mu_word, sigma_word
+        return similarities, t_m, t_s, alpha_t

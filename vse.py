@@ -8,16 +8,16 @@ import torch.nn.init
 import torch.backends.cudnn as cudnn
 from torch.nn.utils import clip_grad_norm_
 
-from encoders import get_image_encoder, get_text_encoder
+from .encoders import get_image_encoder, get_text_encoder
 
-from loss import UTO
+from .loss import UTO
 
 import logging
 import copy
 import torch.nn.functional as F
 logger = logging.getLogger(__name__)
-from graph_model import VisualGraph, TextualGraph
-from GUS import GusEnhancedCCF
+from .graph_model import VisualGraph, TextualGraph
+from .GUS import GusEnhancedCCF
 class USER(nn.Module):
     """
         The standard VSE model
@@ -102,7 +102,7 @@ class USER(nn.Module):
 
         self.i2t_match_G = VisualGraph(16, 32, 1, dropout=.5)
         self.t2i_match_G = TextualGraph(16, 32, 1, dropout=.5)
-        self.gus = GusEnhancedCCF(tau=opt.ccf_tau, lambda_cf=opt.ccf_lambda)
+        self.gus = GusEnhancedCCF(tau=0.1, lambda_cf=0.5)
 
 
     def set_max_violation(self, max_violation):
@@ -158,7 +158,7 @@ class USER(nn.Module):
                 images = images.cuda()
                 captions = captions.cuda()
                 image_lengths = image_lengths.cuda()
-            img_emb = self.img_enc(images, image_lengths)
+            img_emb,img = self.img_enc(images, image_lengths)
             
         else:
             if torch.cuda.is_available():
@@ -167,7 +167,7 @@ class USER(nn.Module):
             img_emb = self.img_enc(images)
 
         lengths = torch.Tensor(lengths).cuda()
-        cap_emb = self.txt_enc(captions, lengths)
+        cap_emb,cap = self.txt_enc(captions, lengths)
 
         if is_train and self.opt.use_moco:
             N = images.shape[0]
@@ -180,9 +180,9 @@ class USER(nn.Module):
 
             self._dequeue_and_enqueue(v_embed_k, t_embed_k)
 
-            return img_emb, cap_emb, loss_moco , lengths , v_embed_k, t_embed_k
+            return img_emb, cap_emb, loss_moco , lengths , v_embed_k, t_embed_k, cap, img
 
-        return img_emb, cap_emb , lengths
+        return img_emb, cap_emb , lengths, cap, img
 
     def forward_loss(self, img_emb, cap_emb):
         """Compute the loss given pairs of image and caption embeddings
@@ -207,21 +207,21 @@ class USER(nn.Module):
 
     def train_emb(self, images, captions, lengths, bbox, depends, image_lengths=None, warmup_alpha=None):
         # 1) embeddings + MoCo
-        img_emb, cap_emb, loss_moco, cap_lens, v_k, t_k = self.forward_emb(images, captions, lengths, image_lengths,
+        img_emb, cap_emb, loss_moco, cap_lens, v_k, t_k,cap = self.forward_emb(images, captions, lengths, image_lengths,
                                                                            is_train=True)
         # 2) encoder loss
-        loss_enc = self.forward_loss(img_emb, cap_emb)
+        #loss_enc = self.forward_loss(img_emb, cap_emb)
 
         # 3) local
-        sim_local, v_m, v_s, t_m, t_s, alpha_v, alpha_t = self.forward_local(img_emb, cap_emb, bbox, depends, cap_lens)
+        sim_local, v_m, v_s, t_m, t_s, alpha_v, alpha_t = self.forward_local(img_emb, cap, bbox, depends, cap_lens)
 
         # 4) global + CCF
-        loss_w2, loss_kl, sim_global, loss_ccf = self.forward_global(v_m, v_s, t_m, t_s, alpha_v, alpha_t)
+        _, loss_kl, sim_global, loss_ccf = self.forward_global(v_m, v_s, t_m, t_s, alpha_v, alpha_t)
 
         # 5) total
         sim = sim_local + sim_global
-        loss_rank = self.rank_loss(sim)
-        total_loss = loss_rank + loss_moco + loss_enc + loss_w2 + loss_kl + loss_ccf
+
+        total_loss =  loss_kl + loss_ccf + sim
 
         # 6) backward/update ...
         self.optimizer.zero_grad()
